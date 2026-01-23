@@ -1,5 +1,5 @@
-import { useState, useRef, useEffect } from "react";
-import { X, Plus } from "lucide-react";
+import { useState, useRef, useEffect, useMemo, memo } from "react";
+import { X, Plus, Lock, Unlock } from "lucide-react";
 import { useAppStore } from "@/stores/appStore";
 import { useClaude } from "@/hooks/useClaude";
 import { PixelCharacter } from "./PixelCharacter";
@@ -9,12 +9,39 @@ import { ContextMenu } from "./ContextMenu";
 import { getCommandIconDisplay } from "./SettingsPanel";
 import { Markdown } from "./Markdown";
 import { Terminal } from "./Terminal";
+import { Services } from "./Services";
+import { Tooltip } from "./Tooltip";
 import type { Conversation, Integration, Skill } from "@/types";
 
 interface ConversationViewProps {
   conversation: Conversation;
   onClose: () => void;
 }
+
+// Static array - moved outside component to avoid recreation
+const builtInCommands = [
+  { trigger: "clear", name: "Clear conversation", type: "builtin" as const },
+  { trigger: "help", name: "Show help", type: "builtin" as const },
+  { trigger: "status", name: "Quest status", type: "builtin" as const },
+  { trigger: "summary", name: "Summarize conversation", type: "builtin" as const },
+  { trigger: "review", name: "Review code changes", type: "builtin" as const },
+];
+
+// Memoized message component - prevents re-rendering all messages on every keystroke
+const MessageItem = memo(function MessageItem({ role, content }: { role: string; content: string }) {
+  return (
+    <div className="text-sm">
+      <span className="text-slate-600">{role === "user" ? "You" : "Claude"}:</span>
+      <div className="text-slate-300 mt-1 ml-2 break-words">
+        {role === "assistant" ? (
+          <Markdown content={content} />
+        ) : (
+          <pre className="whitespace-pre-wrap break-words font-sans">{content}</pre>
+        )}
+      </div>
+    </div>
+  );
+});
 
 export function ConversationView({ conversation, onClose }: ConversationViewProps) {
   const [input, setInput] = useState("");
@@ -46,63 +73,91 @@ export function ConversationView({ conversation, onClose }: ConversationViewProp
     deleteIntegration,
     renameConversation,
     clearMessages,
+    closeConversation,
+    reopenConversation,
+    setClaudeSessionId,
   } = useAppStore();
   const { sendMessage, isLoading, streamingContent, thinking, clearStreaming } = useClaude(conversation.id);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const titleInputRef = useRef<HTMLInputElement>(null);
 
-  const equippedSkills = skills.filter((skill) =>
-    conversation.equippedSkills.includes(skill.id)
+  // Memoize filtered skills - only recompute when skills or equipped list changes
+  const equippedSkills = useMemo(() =>
+    skills.filter((skill) => conversation.equippedSkills.includes(skill.id)),
+    [skills, conversation.equippedSkills]
   );
 
-  const unequippedSkills = skills.filter((skill) =>
-    !conversation.equippedSkills.includes(skill.id)
+  const unequippedSkills = useMemo(() =>
+    skills.filter((skill) => !conversation.equippedSkills.includes(skill.id)),
+    [skills, conversation.equippedSkills]
   );
 
-  // Filter commands by scope - show if no scope set OR if current conversation is in scope
-  const scopedCommands = customCommands.filter((cmd) =>
-    !cmd.scopedConversationIds ||
-    cmd.scopedConversationIds.length === 0 ||
-    cmd.scopedConversationIds.includes(conversation.id)
+  // Memoize scoped commands - only recompute when commands or conversation changes
+  const scopedCommands = useMemo(() =>
+    customCommands.filter((cmd) =>
+      !cmd.scopedConversationIds ||
+      cmd.scopedConversationIds.length === 0 ||
+      cmd.scopedConversationIds.includes(conversation.id)
+    ),
+    [customCommands, conversation.id]
   );
 
-  const quickActions = scopedCommands.filter((cmd) => cmd.isQuickAction);
+  const quickActions = useMemo(() =>
+    scopedCommands.filter((cmd) => cmd.isQuickAction),
+    [scopedCommands]
+  );
 
-  // Autocomplete commands
-  const builtInCommands = [
-    { trigger: "clear", name: "Clear conversation", type: "builtin" as const },
-    { trigger: "help", name: "Show help", type: "builtin" as const },
-    { trigger: "status", name: "Quest status", type: "builtin" as const },
-    { trigger: "summary", name: "Summarize conversation", type: "builtin" as const },
-    { trigger: "review", name: "Review code changes", type: "builtin" as const },
-  ];
-
-  const allCommands = [
+  // Memoize all commands list
+  const allCommands = useMemo(() => [
     ...builtInCommands,
     ...scopedCommands.map(cmd => ({ trigger: cmd.trigger, name: cmd.name, type: cmd.type })),
-  ];
+  ], [scopedCommands]);
 
-  const getFilteredCommands = () => {
+  // Memoize filtered commands - depends on input for autocomplete
+  const filteredCommands = useMemo(() => {
     if (!input.startsWith("/")) return [];
     const query = input.slice(1).toLowerCase();
     if (query === "") return allCommands;
     return allCommands.filter(cmd => cmd.trigger.toLowerCase().startsWith(query));
-  };
+  }, [input, allCommands]);
 
-  const filteredCommands = getFilteredCommands();
-
-  const equippedIntegrations = integrations.filter((int) =>
-    conversation.equippedIntegrations.includes(int.id)
+  // Memoize integrations filtering
+  const equippedIntegrations = useMemo(() =>
+    integrations.filter((int) => conversation.equippedIntegrations.includes(int.id)),
+    [integrations, conversation.equippedIntegrations]
   );
 
-  const unequippedIntegrations = integrations.filter((int) =>
-    !conversation.equippedIntegrations.includes(int.id) && int.enabled
+  const unequippedIntegrations = useMemo(() =>
+    integrations.filter((int) => !conversation.equippedIntegrations.includes(int.id) && int.enabled),
+    [integrations, conversation.equippedIntegrations]
   );
 
-  // Build system prompt from skills and API key integrations
-  const buildSystemPrompt = () => {
+  // Memoize system prompt - only rebuild when equipped skills/integrations change
+  const systemPrompt = useMemo(() => {
     const parts: string[] = [];
+
+    // Base instructions - always included
+    parts.push(`## Output Format for Code Changes
+When making changes to files, always output a summary of the changes in diff format, grouped by file name:
+
+### filename.ext
+\`\`\`diff
+- removed line
++ added line
+\`\`\`
+
+### another-file.ext
+\`\`\`diff
+- old code
++ new code
+\`\`\`
+
+This helps the user quickly see what was modified.
+
+## Style Guidelines
+- Do NOT use emojis. Use ASCII symbols only (e.g., *, -, >, #, =, +, etc.)
+- Keep output clean and terminal-friendly`);
 
     // Add skill effects
     if (equippedSkills.length > 0) {
@@ -130,9 +185,7 @@ Do NOT use curl or MCP tools for ${serviceNames.join(", ")}.`);
     }
 
     return parts.length > 0 ? parts.join("\n\n") : undefined;
-  };
-
-  const systemPrompt = buildSystemPrompt();
+  }, [equippedSkills, equippedIntegrations]);
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -219,46 +272,51 @@ ${customCmds || "  (none)"}`;
         }
 
         // Send to Claude (message already added above)
-        const shouldContinue = conversation.messages.length > 0;
         try {
-          const response = await sendMessage(
+          const result = await sendMessage(
             userMessage,
             systemPrompt,
             conversation.workingDirectory,
             equippedIntegrations.length > 0 ? equippedIntegrations : undefined,
-            shouldContinue
+            conversation.claudeSessionId
           );
           clearStreaming();
-          addMessage(conversation.id, { role: "assistant", content: response });
+          if (result.sessionId) {
+            setClaudeSessionId(conversation.id, result.sessionId);
+          }
+          addMessage(conversation.id, { role: "assistant", content: result.response });
         } catch (err) {
           clearStreaming();
           addMessage(conversation.id, {
             role: "assistant",
-            content: `Error: ${err instanceof Error ? err.message : "Failed to get response"}`,
+            content: `Error: ${err instanceof Error ? err.message : typeof err === 'string' ? err : JSON.stringify(err)}`,
           });
         }
         return;
       }
     }
 
-    const shouldContinue = conversation.messages.length > 0;
     addMessage(conversation.id, { role: "user", content: userMessage });
 
     try {
-      const response = await sendMessage(
+      const result = await sendMessage(
         userMessage,
         systemPrompt,
         conversation.workingDirectory,
         equippedIntegrations.length > 0 ? equippedIntegrations : undefined,
-        shouldContinue
+        conversation.claudeSessionId
       );
       clearStreaming();
-      addMessage(conversation.id, { role: "assistant", content: response });
+      if (result.sessionId) {
+        setClaudeSessionId(conversation.id, result.sessionId);
+      }
+      addMessage(conversation.id, { role: "assistant", content: result.response });
     } catch (err) {
       clearStreaming();
+      const errorMsg = err instanceof Error ? err.message : typeof err === 'string' ? err : JSON.stringify(err);
       addMessage(conversation.id, {
         role: "assistant",
-        content: `Error: ${err instanceof Error ? err.message : "Failed to get response"}`,
+        content: `Error: ${errorMsg}`,
       });
     }
   };
@@ -312,24 +370,26 @@ ${customCmds || "  (none)"}`;
       actualMessage = command.prompt;
     }
 
-    const shouldContinue = conversation.messages.length > 0;
     addMessage(conversation.id, { role: "user", content: displayMessage });
 
     try {
-      const response = await sendMessage(
+      const result = await sendMessage(
         actualMessage,
         systemPrompt,
         conversation.workingDirectory,
         equippedIntegrations.length > 0 ? equippedIntegrations : undefined,
-        shouldContinue
+        conversation.claudeSessionId
       );
       clearStreaming();
-      addMessage(conversation.id, { role: "assistant", content: response });
+      if (result.sessionId) {
+        setClaudeSessionId(conversation.id, result.sessionId);
+      }
+      addMessage(conversation.id, { role: "assistant", content: result.response });
     } catch (err) {
       clearStreaming();
       addMessage(conversation.id, {
         role: "assistant",
-        content: `Error: ${err instanceof Error ? err.message : "Failed to get response"}`,
+        content: `Error: ${err instanceof Error ? err.message : typeof err === 'string' ? err : JSON.stringify(err)}`,
       });
     }
   };
@@ -411,11 +471,31 @@ ${customCmds || "  (none)"}`;
   };
 
   return (
-    <div className="fixed inset-4 z-50 flex bg-slate-950 border border-slate-700">
-      {/* Close button */}
-      <button onClick={onClose} className="absolute top-3 right-3 text-slate-600">
-        <X size={16} />
-      </button>
+    <div className={`fixed inset-4 z-50 flex bg-slate-950 border ${conversation.closed ? "border-amber-900" : "border-slate-700"}`}>
+      {/* Header buttons */}
+      <div className="absolute top-3 right-3 flex items-center gap-2">
+        {conversation.closed ? (
+          <button
+            onClick={() => reopenConversation(conversation.id)}
+            className="text-amber-600 hover:text-amber-400 flex items-center gap-1"
+            title="Reopen conversation"
+          >
+            <Unlock size={14} />
+            <span className="text-xs">Reopen</span>
+          </button>
+        ) : (
+          <button
+            onClick={() => closeConversation(conversation.id)}
+            className="text-slate-600 hover:text-slate-400"
+            title="Close and lock conversation"
+          >
+            <Lock size={14} />
+          </button>
+        )}
+        <button onClick={onClose} className="text-slate-600 hover:text-slate-400">
+          <X size={16} />
+        </button>
+      </div>
 
       {/* Left side - Character + Skills */}
       <div className="w-1/4 border-r border-slate-700 p-4 flex flex-col overflow-hidden">
@@ -449,17 +529,30 @@ ${customCmds || "  (none)"}`;
             {[...Array(5)].map((_, i) => {
               const skill = equippedSkills[i];
               return (
-                <div
+                <Tooltip
                   key={i}
-                  onClick={() => skill && handleUnequipSkill(skill.id)}
-                  className={`w-8 h-8 border flex items-center justify-center text-sm cursor-pointer ${
-                    skill ? "border-slate-600" : "border-slate-800 text-slate-800"
-                  }`}
-                  style={skill?.color ? { color: skill.color } : skill ? { color: "#cbd5e1" } : undefined}
-                  title={skill?.effect}
+                  content={skill ? (
+                    <div>
+                      <div className="font-medium text-slate-100 mb-1">{skill.name}</div>
+                      <div className="text-slate-400">{skill.effect}</div>
+                    </div>
+                  ) : null}
                 >
-                  {skill ? getSkillIconDisplay(skill.icon) : "·"}
-                </div>
+                  {({ onMouseEnter, onMouseLeave, ref }) => (
+                    <div
+                      ref={ref}
+                      onMouseEnter={onMouseEnter}
+                      onMouseLeave={onMouseLeave}
+                      onClick={() => skill && handleUnequipSkill(skill.id)}
+                      className={`w-10 h-10 border flex items-center justify-center text-base cursor-pointer hover:bg-slate-800/50 ${
+                        skill ? "border-slate-600" : "border-slate-800 text-slate-800"
+                      }`}
+                      style={skill?.color ? { color: skill.color } : skill ? { color: "#cbd5e1" } : undefined}
+                    >
+                      {skill ? getSkillIconDisplay(skill.icon) : "·"}
+                    </div>
+                  )}
+                </Tooltip>
               );
             })}
           </div>
@@ -499,21 +592,34 @@ ${customCmds || "  (none)"}`;
               const integration = equippedIntegrations[i];
               const defaultColor = integration?.type === "mcp" ? "#22d3ee" : "#fbbf24";
               return (
-                <div
+                <Tooltip
                   key={i}
-                  onClick={() => integration && handleUnequipIntegration(integration.id)}
-                  className={`w-12 h-12 border flex items-center justify-center text-lg cursor-pointer ${
-                    integration
-                      ? integration.type === "mcp"
-                        ? "border-cyan-700"
-                        : "border-amber-700"
-                      : "border-slate-800 text-slate-800"
-                  }`}
-                  style={integration ? { color: integration.color || defaultColor } : undefined}
-                  title={integration ? `${integration.name}: ${integration.description}` : "Integration slot"}
+                  content={integration ? (
+                    <div>
+                      <div className="font-medium text-slate-100 mb-1">{integration.name}</div>
+                      <div className="text-slate-400">{integration.description}</div>
+                    </div>
+                  ) : null}
                 >
-                  {integration ? getIconDisplay(integration.icon) : "·"}
-                </div>
+                  {({ onMouseEnter, onMouseLeave, ref }) => (
+                    <div
+                      ref={ref}
+                      onMouseEnter={onMouseEnter}
+                      onMouseLeave={onMouseLeave}
+                      onClick={() => integration && handleUnequipIntegration(integration.id)}
+                      className={`w-14 h-14 border flex items-center justify-center text-xl cursor-pointer hover:bg-slate-800/50 ${
+                        integration
+                          ? integration.type === "mcp"
+                            ? "border-cyan-700"
+                            : "border-amber-700"
+                          : "border-slate-800 text-slate-800"
+                      }`}
+                      style={integration ? { color: integration.color || defaultColor } : undefined}
+                    >
+                      {integration ? getIconDisplay(integration.icon) : "·"}
+                    </div>
+                  )}
+                </Tooltip>
               );
             })}
           </div>
@@ -533,19 +639,32 @@ ${customCmds || "  (none)"}`;
           </div>
           <div className="flex flex-wrap gap-1">
             {unequippedSkills.map((skill) => (
-              <div
+              <Tooltip
                 key={skill.id}
-                onClick={() => handleEquipSkill(skill.id)}
-                onContextMenu={(e) => {
-                  e.preventDefault();
-                  setSkillContextMenu({ x: e.clientX, y: e.clientY, skill });
-                }}
-                className="w-10 h-10 border border-slate-800 flex items-center justify-center text-lg cursor-pointer text-slate-500 hover:text-slate-300 hover:border-slate-600"
-                style={skill.color ? { color: skill.color } : undefined}
-                title={`${skill.name}: ${skill.effect}`}
+                content={
+                  <div>
+                    <div className="font-medium text-slate-100 mb-1">{skill.name}</div>
+                    <div className="text-slate-400">{skill.effect}</div>
+                  </div>
+                }
               >
-                {getSkillIconDisplay(skill.icon)}
-              </div>
+                {({ onMouseEnter, onMouseLeave, ref }) => (
+                  <div
+                    ref={ref}
+                    onMouseEnter={onMouseEnter}
+                    onMouseLeave={onMouseLeave}
+                    onClick={() => handleEquipSkill(skill.id)}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      setSkillContextMenu({ x: e.clientX, y: e.clientY, skill });
+                    }}
+                    className="w-12 h-12 border border-slate-800 flex items-center justify-center text-xl cursor-pointer text-slate-500 hover:text-slate-300 hover:border-slate-600 hover:bg-slate-800/50"
+                    style={skill.color ? { color: skill.color } : undefined}
+                  >
+                    {getSkillIconDisplay(skill.icon)}
+                  </div>
+                )}
+              </Tooltip>
             ))}
           </div>
         </div>
@@ -567,37 +686,53 @@ ${customCmds || "  (none)"}`;
               const defaultColor = integration.type === "mcp" ? "#0891b2" : "#d97706";
               const hoverColor = integration.type === "mcp" ? "#22d3ee" : "#fbbf24";
               return (
-                <div
+                <Tooltip
                   key={integration.id}
-                  onClick={() => handleEquipIntegration(integration.id)}
-                  onContextMenu={(e) => {
-                    e.preventDefault();
-                    setIntegrationContextMenu({ x: e.clientX, y: e.clientY, integration });
-                  }}
-                  className={`w-10 h-10 border flex items-center justify-center text-lg cursor-pointer transition-colors ${
-                    integration.type === "mcp"
-                      ? "border-cyan-900 hover:border-cyan-700"
-                      : "border-amber-900 hover:border-amber-700"
-                  }`}
-                  style={{ color: integration.color || defaultColor }}
-                  onMouseEnter={(e) => {
-                    if (!integration.color) {
-                      e.currentTarget.style.color = hoverColor;
-                    }
-                  }}
-                  onMouseLeave={(e) => {
-                    if (!integration.color) {
-                      e.currentTarget.style.color = defaultColor;
-                    }
-                  }}
-                  title={`${integration.name}: ${integration.description}`}
+                  content={
+                    <div>
+                      <div className="font-medium text-slate-100 mb-1">{integration.name}</div>
+                      <div className="text-slate-400">{integration.description}</div>
+                    </div>
+                  }
                 >
-                  {getIconDisplay(integration.icon)}
-                </div>
+                  {({ onMouseEnter, onMouseLeave, ref }) => (
+                    <div
+                      ref={ref}
+                      onClick={() => handleEquipIntegration(integration.id)}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        setIntegrationContextMenu({ x: e.clientX, y: e.clientY, integration });
+                      }}
+                      className={`w-12 h-12 border flex items-center justify-center text-xl cursor-pointer transition-colors hover:bg-slate-800/50 ${
+                        integration.type === "mcp"
+                          ? "border-cyan-900 hover:border-cyan-700"
+                          : "border-amber-900 hover:border-amber-700"
+                      }`}
+                      style={{ color: integration.color || defaultColor }}
+                      onMouseEnter={(e) => {
+                        onMouseEnter();
+                        if (!integration.color) {
+                          e.currentTarget.style.color = hoverColor;
+                        }
+                      }}
+                      onMouseLeave={(e) => {
+                        onMouseLeave();
+                        if (!integration.color) {
+                          e.currentTarget.style.color = defaultColor;
+                        }
+                      }}
+                    >
+                      {getIconDisplay(integration.icon)}
+                    </div>
+                  )}
+                </Tooltip>
               );
             })}
           </div>
         </div>
+
+        {/* Services */}
+        <Services conversation={conversation} />
 
         {/* Terminal */}
         <Terminal
@@ -684,16 +819,7 @@ ${customCmds || "  (none)"}`;
           )}
 
           {conversation.messages.map((msg) => (
-            <div key={msg.id} className="text-sm">
-              <span className="text-slate-600">{msg.role === "user" ? "You" : "Claude"}:</span>
-              <div className="text-slate-300 mt-1 ml-2">
-                {msg.role === "assistant" ? (
-                  <Markdown content={msg.content} />
-                ) : (
-                  <pre className="whitespace-pre-wrap font-sans">{msg.content}</pre>
-                )}
-              </div>
-            </div>
+            <MessageItem key={msg.id} role={msg.role} content={msg.content} />
           ))}
 
           {isLoading && conversation.messages[conversation.messages.length - 1]?.role !== "assistant" && (
@@ -709,25 +835,33 @@ ${customCmds || "  (none)"}`;
         </div>
 
         {/* Input */}
-        <div className="border-t border-slate-700">
-          {/* Quick Actions */}
-          {quickActions.length > 0 && (
-            <div className="flex flex-wrap gap-1 px-4 pt-3">
-              {quickActions.map((cmd) => (
-                <button
-                  key={cmd.id}
-                  onClick={() => handleQuickAction(cmd)}
-                  disabled={isLoading}
-                  className="flex items-center gap-1 px-2 py-1 text-xs border border-slate-700 hover:border-slate-600 disabled:opacity-50 leading-none"
-                  style={{ color: cmd.color }}
-                  title={cmd.prompt}
-                >
-                  <span className="flex items-center">{getCommandIconDisplay(cmd.icon)}</span>
-                  <span className="flex items-center">{cmd.name}</span>
-                </button>
-              ))}
+        <div className={`border-t ${conversation.closed ? "border-amber-900" : "border-slate-700"}`}>
+          {/* Closed conversation notice */}
+          {conversation.closed ? (
+            <div className="p-4 flex items-center justify-center gap-2 text-amber-600">
+              <Lock size={14} />
+              <span className="text-sm">This conversation is closed</span>
             </div>
-          )}
+          ) : (
+            <>
+            {/* Quick Actions */}
+            {quickActions.length > 0 && (
+              <div className="flex flex-wrap gap-1 px-4 pt-3">
+                {quickActions.map((cmd) => (
+                  <button
+                    key={cmd.id}
+                    onClick={() => handleQuickAction(cmd)}
+                    disabled={isLoading}
+                    className="flex items-center gap-1 px-2 py-1 text-xs border border-slate-700 hover:border-slate-600 disabled:opacity-50 leading-none"
+                    style={{ color: cmd.color }}
+                    title={cmd.prompt}
+                  >
+                    <span className="flex items-center">{getCommandIconDisplay(cmd.icon)}</span>
+                    <span className="flex items-center">{cmd.name}</span>
+                  </button>
+                ))}
+              </div>
+            )}
 
           <form onSubmit={handleSubmit} className="p-4 relative">
             {/* Autocomplete dropdown */}
@@ -778,6 +912,8 @@ ${customCmds || "  (none)"}`;
               </button>
             </div>
           </form>
+          </>
+          )}
         </div>
       </div>
     </div>

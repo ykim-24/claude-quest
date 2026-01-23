@@ -5,7 +5,7 @@ import type { AppState, Conversation, Message, Character, PlayerCharacter } from
 
 // Custom storage using Tauri filesystem
 const tauriStorage: StateStorage = {
-  getItem: async (name: string): Promise<string | null> => {
+  getItem: async (_name: string): Promise<string | null> => {
     try {
       const data = await invoke<string | null>("load_data");
       return data;
@@ -14,14 +14,14 @@ const tauriStorage: StateStorage = {
       return null;
     }
   },
-  setItem: async (name: string, value: string): Promise<void> => {
+  setItem: async (_name: string, value: string): Promise<void> => {
     try {
       await invoke("save_data", { data: value });
     } catch (e) {
       console.error("Failed to save data:", e);
     }
   },
-  removeItem: async (name: string): Promise<void> => {
+  removeItem: async (_name: string): Promise<void> => {
     try {
       await invoke("save_data", { data: "{}" });
     } catch (e) {
@@ -46,6 +46,7 @@ export const useAppStore = create<AppState>()(
       skills: [],
       integrations: [],
       customCommands: [],
+      scheduledTasks: [],
       characters: defaultCharacters,
       playerCharacter: null,
       activeConversationId: null,
@@ -162,7 +163,7 @@ export const useAppStore = create<AppState>()(
         set((state) => ({
           conversations: state.conversations.map((conv) =>
             conv.id === conversationId
-              ? { ...conv, messages: [], tokensUsed: 0 }
+              ? { ...conv, messages: [], tokensUsed: 0, claudeSessionId: undefined }
               : conv
           ),
         })),
@@ -255,6 +256,24 @@ export const useAppStore = create<AppState>()(
           customCommands: state.customCommands.filter((cmd) => cmd.id !== id),
         })),
 
+      // Scheduled task actions
+      addScheduledTask: (task) =>
+        set((state) => ({
+          scheduledTasks: [...state.scheduledTasks, { ...task, id: crypto.randomUUID() }],
+        })),
+
+      updateScheduledTask: (id, changes) =>
+        set((state) => ({
+          scheduledTasks: state.scheduledTasks.map((task) =>
+            task.id === id ? { ...task, ...changes } : task
+          ),
+        })),
+
+      deleteScheduledTask: (id) =>
+        set((state) => ({
+          scheduledTasks: state.scheduledTasks.filter((task) => task.id !== id),
+        })),
+
       markConversationSeen: (conversationId) =>
         set((state) => ({
           conversations: state.conversations.map((conv) =>
@@ -263,12 +282,77 @@ export const useAppStore = create<AppState>()(
               : conv
           ),
         })),
+
+      closeConversation: (conversationId) =>
+        set((state) => ({
+          conversations: state.conversations.map((conv) =>
+            conv.id === conversationId
+              ? { ...conv, closed: true }
+              : conv
+          ),
+          // Also deselect if it was active
+          activeConversationId: state.activeConversationId === conversationId ? null : state.activeConversationId,
+        })),
+
+      reopenConversation: (conversationId) =>
+        set((state) => ({
+          conversations: state.conversations.map((conv) =>
+            conv.id === conversationId
+              ? { ...conv, closed: false }
+              : conv
+          ),
+        })),
+
+      addService: (conversationId, service) =>
+        set((state) => ({
+          conversations: state.conversations.map((conv) =>
+            conv.id === conversationId
+              ? {
+                  ...conv,
+                  services: [
+                    ...(conv.services || []),
+                    { ...service, id: crypto.randomUUID() },
+                  ],
+                }
+              : conv
+          ),
+        })),
+
+      removeService: (conversationId, serviceId) =>
+        set((state) => ({
+          conversations: state.conversations.map((conv) =>
+            conv.id === conversationId
+              ? {
+                  ...conv,
+                  services: (conv.services || []).filter((s) => s.id !== serviceId),
+                }
+              : conv
+          ),
+        })),
+
+      setClaudeSessionId: (conversationId, sessionId) =>
+        set((state) => ({
+          conversations: state.conversations.map((conv) =>
+            conv.id === conversationId
+              ? { ...conv, claudeSessionId: sessionId }
+              : conv
+          ),
+        })),
+
+      setCharacter: (conversationId, characterId) =>
+        set((state) => ({
+          conversations: state.conversations.map((conv) =>
+            conv.id === conversationId
+              ? { ...conv, character: characterId }
+              : conv
+          ),
+        })),
     }),
     {
       name: "claude-quest-storage",
       storage: createJSONStorage(() => tauriStorage),
       // Migration to handle old data format
-      migrate: (persistedState: unknown, version: number) => {
+      migrate: (persistedState: unknown, _version: number) => {
         const state = persistedState as Record<string, unknown>;
 
         // Migrate inventory -> skills
@@ -325,9 +409,14 @@ export const useAppStore = create<AppState>()(
           state.customCommands = [];
         }
 
+        // Ensure scheduledTasks exist
+        if (!state.scheduledTasks) {
+          state.scheduledTasks = [];
+        }
+
         return state;
       },
-      version: 6,
+      version: 7,
     }
   )
 );

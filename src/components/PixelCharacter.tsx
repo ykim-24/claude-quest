@@ -331,8 +331,8 @@ const accessoryTemplates: Record<string, number[][]> = {
   ],
 };
 
-// Equipment templates - items that can be equipped in inventory
-const equipmentTemplates: Record<string, number[][]> = {
+// Equipment templates - items that can be equipped in inventory (reserved for future use)
+export const equipmentTemplates: Record<string, number[][]> = {
   // Sword - held in right hand
   sword: [
     [0,0,0,0,0,0,0,0,0,0,0,0,0,0,9,0],
@@ -543,11 +543,11 @@ export function PixelCharacter({ classId, customization, color, size = 192 }: Pi
   `;
 
   const baseTemplate = baseTemplates[classId] || baseTemplates.claude;
-  const hatTemplate = customization.hat ? hatTemplates[customization.hat] : null;
-  const hairTemplate = customization.hair ? hairTemplates[customization.hair] : null;
-  const beardTemplate = customization.beard ? beardTemplates[customization.beard] : null;
-  const topTemplate = customization.top ? topTemplates[customization.top] : null;
-  const accessoryTemplate = customization.accessory ? accessoryTemplates[customization.accessory] : null;
+  const hatTemplate = customization.hat ? hatTemplates[customization.hat] : undefined;
+  const hairTemplate = customization.hair ? hairTemplates[customization.hair] : undefined;
+  const beardTemplate = customization.beard ? beardTemplates[customization.beard] : undefined;
+  const topTemplate = customization.top ? topTemplates[customization.top] : undefined;
+  const accessoryTemplate = customization.accessory ? accessoryTemplates[customization.accessory] : undefined;
 
   // Eye positions for blinking (in 16x16 grid)
   const leftEyeX = 5;

@@ -42,6 +42,7 @@ export function Terminal({ workingDirectory, currentTokens, totalTokens }: Termi
   const [isRunning, setIsRunning] = useState(false);
   const [commandHistory, setCommandHistory] = useState<string[]>([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
+  const [currentProcessId, setCurrentProcessId] = useState<string | null>(null);
   const outputRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -57,6 +58,16 @@ export function Terminal({ workingDirectory, currentTokens, totalTokens }: Termi
     }
   }, [isExpanded]);
 
+  const killCurrentProcess = async () => {
+    if (currentProcessId) {
+      try {
+        await invoke("kill_shell_process", { processId: currentProcessId });
+      } catch (err) {
+        console.error("Failed to kill process:", err);
+      }
+    }
+  };
+
   const runCommand = async () => {
     if (!input.trim() || isRunning) return;
 
@@ -71,10 +82,13 @@ export function Terminal({ workingDirectory, currentTokens, totalTokens }: Termi
       return;
     }
 
+    const processId = crypto.randomUUID();
+    setCurrentProcessId(processId);
     setIsRunning(true);
 
     try {
       const output = await invoke<ShellOutput>("run_shell_command", {
+        processId,
         command: cmd,
         workingDirectory,
       });
@@ -98,10 +112,23 @@ export function Terminal({ workingDirectory, currentTokens, totalTokens }: Termi
       ]);
     } finally {
       setIsRunning(false);
+      setCurrentProcessId(null);
     }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    // Handle Ctrl+C to kill running process
+    if (e.ctrlKey && e.key === "c") {
+      if (isRunning) {
+        e.preventDefault();
+        killCurrentProcess();
+        return;
+      }
+      // If not running, clear input (standard terminal behavior)
+      setInput("");
+      return;
+    }
+
     if (e.key === "Enter") {
       e.preventDefault();
       runCommand();
@@ -163,7 +190,7 @@ export function Terminal({ workingDirectory, currentTokens, totalTokens }: Termi
                     {stripAnsi(entry.output.stderr)}
                   </pre>
                 )}
-                {entry.output.exit_code !== 0 && (
+                {entry.output.exit_code !== 0 && entry.output.exit_code !== 130 && (
                   <div className="text-slate-600">
                     exit code: {entry.output.exit_code}
                   </div>
@@ -171,7 +198,10 @@ export function Terminal({ workingDirectory, currentTokens, totalTokens }: Termi
               </div>
             ))}
             {isRunning && (
-              <div className="text-slate-500 animate-pulse">Running...</div>
+              <div className="text-slate-500">
+                <span className="animate-pulse">Running...</span>
+                <span className="text-slate-600 ml-2">(Ctrl+C to cancel)</span>
+              </div>
             )}
           </div>
 
@@ -184,8 +214,7 @@ export function Terminal({ workingDirectory, currentTokens, totalTokens }: Termi
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              disabled={isRunning}
-              placeholder="Enter command..."
+              placeholder={isRunning ? "Ctrl+C to cancel..." : "Enter command..."}
               className="flex-1 bg-transparent text-xs font-mono text-slate-300 placeholder-slate-600 focus:outline-none"
             />
           </div>

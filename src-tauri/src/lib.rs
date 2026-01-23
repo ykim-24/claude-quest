@@ -1,11 +1,32 @@
 use serde::{Deserialize, Serialize};
 use std::process::Stdio;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tauri::Emitter;
 use tauri::Manager;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use tokio::process::{Command, Child};
+use tokio::sync::Mutex;
 use std::path::PathBuf;
+use once_cell::sync::Lazy;
+
+
+// Global map to track running shell processes
+static RUNNING_PROCESSES: Lazy<Arc<Mutex<HashMap<String, Child>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+
+// Global map to track running services (long-running processes)
+static RUNNING_SERVICES: Lazy<Arc<Mutex<HashMap<String, Child>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+
+#[derive(Clone, Serialize)]
+pub struct ServiceOutput {
+    pub service_id: String,
+    pub output: String,
+    pub is_stderr: bool,
+    pub is_complete: bool,
+    pub exit_code: Option<i32>,
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ClaudeResponse {
@@ -15,6 +36,12 @@ pub struct ClaudeResponse {
     pub thinking: Option<String>,
     #[serde(default)]
     pub tokens_used: Option<u64>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ClaudeResult {
+    pub response: String,
+    pub session_id: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -129,13 +156,13 @@ async fn send_to_claude(
     system_prompt: Option<String>,
     working_directory: Option<String>,
     integrations: Option<Vec<IntegrationConfig>>,
-    continue_conversation: Option<bool>,
-) -> Result<String, String> {
+    session_id: Option<String>,
+) -> Result<ClaudeResult, String> {
     let mut cmd = Command::new("claude");
 
-    // Continue the conversation if requested
-    if continue_conversation.unwrap_or(false) {
-        cmd.arg("--continue");
+    // Resume specific session if provided (for conversation continuity)
+    if let Some(ref sid) = session_id {
+        cmd.arg("--resume").arg(sid);
     }
 
     if let Some(prompt) = system_prompt {
@@ -236,6 +263,8 @@ async fn send_to_claude(
 
     let mut full_response = String::new();
     let mut total_tokens: u64 = 0;
+    let mut result_session_id: Option<String> = None;
+    let mut error_message: Option<String> = None;
 
     while let Some(line) = reader.next_line().await.map_err(|e| e.to_string())? {
         // Parse JSON line
@@ -243,6 +272,25 @@ async fn send_to_claude(
             let msg_type = json.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
             match msg_type {
+                "error" => {
+                    // Capture error messages from the JSON stream
+                    if let Some(err) = json.get("error") {
+                        let msg = err.get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or_else(|| err.as_str().unwrap_or("Unknown error"));
+                        error_message = Some(msg.to_string());
+                    } else if let Some(msg) = json.get("message").and_then(|m| m.as_str()) {
+                        error_message = Some(msg.to_string());
+                    }
+                }
+                "system" => {
+                    // System messages might contain errors too
+                    if let Some(msg) = json.get("message").and_then(|m| m.as_str()) {
+                        if msg.to_lowercase().contains("error") {
+                            error_message = Some(msg.to_string());
+                        }
+                    }
+                }
                 "assistant" => {
                     // Extract text content from assistant message
                     if let Some(message) = json.get("message") {
@@ -290,11 +338,20 @@ async fn send_to_claude(
                     }
                 }
                 "result" => {
+                    // Check if result is an error
+                    let is_error = json.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
+
                     // Final result - extract the result text if we didn't get it from streaming
-                    if full_response.is_empty() {
-                        if let Some(result) = json.get("result").and_then(|r| r.as_str()) {
+                    if let Some(result) = json.get("result").and_then(|r| r.as_str()) {
+                        if is_error {
+                            error_message = Some(result.to_string());
+                        } else if full_response.is_empty() {
                             full_response = result.to_string();
                         }
+                    }
+                    // Extract session ID for conversation continuity
+                    if let Some(sid) = json.get("session_id").and_then(|s| s.as_str()) {
+                        result_session_id = Some(sid.to_string());
                     }
                     // Extract token usage - try different possible locations
                     if let Some(usage) = json.get("usage") {
@@ -336,12 +393,19 @@ async fn send_to_claude(
     }
 
     if !status.success() {
-        let err_msg = if stderr_output.is_empty() {
-            format!("Claude exited with status: {}", status)
+        let err_msg = if let Some(err) = error_message {
+            err
+        } else if !stderr_output.is_empty() {
+            format!("Claude error: {}", stderr_output)
         } else {
-            format!("Claude exited with status: {}. Stderr: {}", status, stderr_output)
+            format!("Claude exited with status: {}", status)
         };
         return Err(err_msg);
+    }
+
+    // Also return error if we got one in the stream even if status was success
+    if let Some(err) = error_message {
+        return Err(err);
     }
 
     let _ = app.emit(&format!("claude-response-{}", conversation_id), ClaudeResponse {
@@ -351,7 +415,10 @@ async fn send_to_claude(
         tokens_used: if total_tokens > 0 { Some(total_tokens) } else { None },
     });
 
-    Ok(full_response.trim().to_string())
+    Ok(ClaudeResult {
+        response: full_response.trim().to_string(),
+        session_id: result_session_id,
+    })
 }
 
 #[derive(Clone, Serialize)]
@@ -361,8 +428,13 @@ pub struct ShellOutput {
     pub exit_code: i32,
 }
 
+// Track process IDs that should be killed
+static KILL_SIGNALS: Lazy<Arc<Mutex<std::collections::HashSet<String>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(std::collections::HashSet::new())));
+
 #[tauri::command]
 async fn run_shell_command(
+    process_id: String,
     command: String,
     working_directory: Option<String>,
 ) -> Result<ShellOutput, String> {
@@ -373,15 +445,235 @@ async fn run_shell_command(
         cmd.current_dir(dir);
     }
 
+    // Create process group so we can kill all children
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
+
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let output = cmd.output().await.map_err(|e| format!("Failed to execute command: {}", e))?;
+    let child = cmd.spawn().map_err(|e| format!("Failed to spawn command: {}", e))?;
 
-    Ok(ShellOutput {
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        exit_code: output.status.code().unwrap_or(-1),
-    })
+    // Store process ID mapping
+    let child_pid = child.id();
+    {
+        let mut processes = RUNNING_PROCESSES.lock().await;
+        processes.insert(process_id.clone(), child);
+    }
+
+    // Wait for the process in a loop, checking for kill signal
+    loop {
+        // Check if we should kill
+        {
+            let mut signals = KILL_SIGNALS.lock().await;
+            if signals.remove(&process_id) {
+                // Kill signal received
+                let mut processes = RUNNING_PROCESSES.lock().await;
+                if let Some(mut child) = processes.remove(&process_id) {
+                    // Kill the process group on Unix
+                    #[cfg(unix)]
+                    if let Some(pid) = child_pid {
+                        unsafe {
+                            libc::killpg(pid as i32, libc::SIGTERM);
+                        }
+                    }
+                    let _ = child.kill().await;
+                }
+                return Ok(ShellOutput {
+                    stdout: String::new(),
+                    stderr: "^C".to_string(),
+                    exit_code: 130, // Standard exit code for SIGINT
+                });
+            }
+        }
+
+        // Check if process finished
+        {
+            let mut processes = RUNNING_PROCESSES.lock().await;
+            if let Some(child) = processes.get_mut(&process_id) {
+                match child.try_wait() {
+                    Ok(Some(_)) => {
+                        // Process finished, get output
+                        if let Some(child) = processes.remove(&process_id) {
+                            let output = child.wait_with_output().await
+                                .map_err(|e| format!("Failed to get output: {}", e))?;
+                            return Ok(ShellOutput {
+                                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                                exit_code: output.status.code().unwrap_or(-1),
+                            });
+                        }
+                    }
+                    Ok(None) => {
+                        // Still running, continue loop
+                    }
+                    Err(e) => {
+                        processes.remove(&process_id);
+                        return Err(format!("Error checking process: {}", e));
+                    }
+                }
+            } else {
+                // Process was removed (killed elsewhere)
+                return Ok(ShellOutput {
+                    stdout: String::new(),
+                    stderr: "Process terminated".to_string(),
+                    exit_code: -1,
+                });
+            }
+        }
+
+        // Small delay to avoid busy waiting
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[tauri::command]
+async fn kill_shell_process(process_id: String) -> Result<bool, String> {
+    // Signal the process to be killed
+    let mut signals = KILL_SIGNALS.lock().await;
+    signals.insert(process_id);
+    Ok(true)
+}
+
+#[tauri::command]
+async fn start_service(
+    app: tauri::AppHandle,
+    service_id: String,
+    command: String,
+    working_directory: Option<String>,
+) -> Result<(), String> {
+    // Check if service is already running
+    {
+        let services = RUNNING_SERVICES.lock().await;
+        if services.contains_key(&service_id) {
+            return Err("Service is already running".to_string());
+        }
+    }
+
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(&command);
+
+    if let Some(dir) = working_directory {
+        cmd.current_dir(dir);
+    }
+
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to start service: {}", e))?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    // Store the child process
+    {
+        let mut services = RUNNING_SERVICES.lock().await;
+        services.insert(service_id.clone(), child);
+    }
+
+    let app_clone = app.clone();
+    let service_id_clone = service_id.clone();
+
+    // Spawn task to read stdout
+    if let Some(stdout) = stdout {
+        let app = app_clone.clone();
+        let sid = service_id_clone.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let _ = app.emit(&format!("service-output-{}", sid), ServiceOutput {
+                    service_id: sid.clone(),
+                    output: line,
+                    is_stderr: false,
+                    is_complete: false,
+                    exit_code: None,
+                });
+            }
+        });
+    }
+
+    // Spawn task to read stderr
+    if let Some(stderr) = stderr {
+        let app = app_clone.clone();
+        let sid = service_id_clone.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let _ = app.emit(&format!("service-output-{}", sid), ServiceOutput {
+                    service_id: sid.clone(),
+                    output: line,
+                    is_stderr: true,
+                    is_complete: false,
+                    exit_code: None,
+                });
+            }
+        });
+    }
+
+    // Spawn task to wait for process completion
+    let app = app_clone;
+    let sid = service_id_clone;
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+            let mut services = RUNNING_SERVICES.lock().await;
+            if let Some(child) = services.get_mut(&sid) {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        services.remove(&sid);
+                        let _ = app.emit(&format!("service-output-{}", sid), ServiceOutput {
+                            service_id: sid.clone(),
+                            output: String::new(),
+                            is_stderr: false,
+                            is_complete: true,
+                            exit_code: status.code(),
+                        });
+                        break;
+                    }
+                    Ok(None) => {
+                        // Still running
+                    }
+                    Err(_) => {
+                        services.remove(&sid);
+                        break;
+                    }
+                }
+            } else {
+                // Service was stopped externally
+                break;
+            }
+        }
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn stop_service(service_id: String) -> Result<bool, String> {
+    let mut services = RUNNING_SERVICES.lock().await;
+    if let Some(mut child) = services.remove(&service_id) {
+        // Try to get the process group and kill it
+        #[cfg(unix)]
+        if let Some(pid) = child.id() {
+            unsafe {
+                libc::killpg(pid as i32, libc::SIGTERM);
+            }
+        }
+        child.kill().await.map_err(|e| format!("Failed to stop service: {}", e))?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+#[tauri::command]
+async fn get_running_services() -> Result<Vec<String>, String> {
+    let services = RUNNING_SERVICES.lock().await;
+    Ok(services.keys().cloned().collect())
 }
 
 #[tauri::command]
@@ -407,6 +699,10 @@ pub fn run() {
             send_to_claude,
             check_claude_installed,
             run_shell_command,
+            kill_shell_process,
+            start_service,
+            stop_service,
+            get_running_services,
             save_data,
             load_data,
             list_directory,

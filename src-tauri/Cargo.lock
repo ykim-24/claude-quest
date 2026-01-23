@@ -446,6 +446,8 @@ name = "claude-quest"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "libc",
+ "once_cell",
  "serde",
  "serde_json",
  "tauri",

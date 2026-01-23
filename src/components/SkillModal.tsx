@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { X } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
-import type { Skill, SkillType } from "@/types";
+import type { Skill } from "@/types";
 
 interface SkillModalProps {
   skill?: Skill | null;
@@ -68,7 +68,6 @@ export function getSkillIconDisplay(iconValue: string): string {
 export function SkillModal({ skill, onSave, onDelete, onClose }: SkillModalProps) {
   const [name, setName] = useState(skill?.name || "");
   const [description, setDescription] = useState(skill?.description || "");
-  const [type, setType] = useState<SkillType>(skill?.type || "modifier");
   const [icon, setIcon] = useState(skill?.icon || "gem");
   const [color, setColor] = useState(skill?.color || "");
   const [effect, setEffect] = useState(skill?.effect || "");
@@ -90,7 +89,7 @@ export function SkillModal({ skill, onSave, onDelete, onClose }: SkillModalProps
 Original prompt:
 ${effect}`;
 
-      const response = await invoke<string>("send_to_claude", {
+      const result = await invoke<{ response: string; session_id: string | null }>("send_to_claude", {
         conversationId: "improve-prompt-" + Date.now(),
         message: improveRequest,
         systemPrompt: "You are a helpful assistant that improves prompts. Only output the improved prompt text, no explanations or markdown.",
@@ -98,7 +97,7 @@ ${effect}`;
         integrations: null,
       });
 
-      setImprovedEffect(response.trim());
+      setImprovedEffect(result.response.trim());
     } catch (err) {
       console.error("Failed to improve prompt:", err);
     } finally {
@@ -123,7 +122,6 @@ ${effect}`;
     const data: Omit<Skill, "id"> | Skill = {
       name,
       description,
-      type,
       icon,
       color: color || undefined,
       effect,
@@ -170,27 +168,6 @@ ${effect}`;
               placeholder="Short description of what this skill does"
               className="w-full px-3 py-2 bg-slate-800 border border-slate-700 text-slate-200 text-sm focus:outline-none focus:border-slate-500"
             />
-          </div>
-
-          {/* Type */}
-          <div>
-            <label className="text-xs text-slate-500 block mb-2">Type</label>
-            <div className="flex gap-1 flex-wrap">
-              {(["passive", "active", "modifier", "ability"] as SkillType[]).map((t) => (
-                <button
-                  key={t}
-                  type="button"
-                  onClick={() => setType(t)}
-                  className={`px-3 py-1 text-xs border ${
-                    type === t
-                      ? "border-slate-500 text-slate-300"
-                      : "border-slate-800 text-slate-600"
-                  }`}
-                >
-                  {t.charAt(0).toUpperCase() + t.slice(1)}
-                </button>
-              ))}
-            </div>
           </div>
 
           {/* Icon */}

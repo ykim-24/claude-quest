@@ -5,6 +5,12 @@ export interface Message {
   timestamp: Date;
 }
 
+export interface ConversationService {
+  id: string;
+  name: string;
+  command: string;
+}
+
 export interface Conversation {
   id: string;
   title: string;
@@ -18,6 +24,9 @@ export interface Conversation {
   character: string;
   lastSeenMessageCount: number;
   tokensUsed: number;
+  closed?: boolean; // When true, conversation is locked and read-only
+  services?: ConversationService[]; // Configured services for this conversation
+  claudeSessionId?: string; // Claude CLI session ID for conversation continuity
 }
 
 export interface Character {
@@ -42,16 +51,13 @@ export interface PlayerCharacter {
   customization: CharacterCustomization;
 }
 
-export type SkillType = "passive" | "active" | "modifier" | "ability";
-
 export interface Skill {
   id: string;
   name: string;
   description: string;
-  type: SkillType;
   icon: string;
   color?: string;
-  effect: string; // System prompt or modifier
+  effect: string; // System prompt added when skill is equipped
 }
 
 export type IntegrationType = "mcp" | "api-key";
@@ -87,11 +93,28 @@ export interface CustomCommand {
   scopedConversationIds?: string[]; // If set, only show in these conversations (empty = all)
 }
 
+export interface ScheduledTask {
+  id: string;
+  name: string;           // Display name
+  type: "cli" | "prompt"; // Type of task
+  command: string;        // CLI command or prompt text
+  workingDirectory?: string; // Directory to run command in (for CLI)
+  conversationIds?: string[]; // Conversations for context (for prompt type, optional)
+  intervalMinutes: number; // How often to run (in minutes)
+  enabled: boolean;       // Whether the task is active
+  lastRun?: Date;         // Last time this task ran
+  nextRun?: Date;         // Next scheduled run time
+  lastOutput?: string;    // Output from last run
+  lastStatus?: "success" | "error"; // Status of last run
+  hasNewOutput?: boolean; // Whether there's unread output
+}
+
 export interface AppState {
   conversations: Conversation[];
   skills: Skill[];
   integrations: Integration[];
   customCommands: CustomCommand[];
+  scheduledTasks: ScheduledTask[];
   characters: Character[];
   playerCharacter: PlayerCharacter | null;
   activeConversationId: string | null;
@@ -122,6 +145,20 @@ export interface AppState {
   addCustomCommand: (command: Omit<CustomCommand, "id">) => void;
   updateCustomCommand: (id: string, changes: Partial<CustomCommand>) => void;
   deleteCustomCommand: (id: string) => void;
+  // Scheduled task actions
+  addScheduledTask: (task: Omit<ScheduledTask, "id">) => void;
+  updateScheduledTask: (id: string, changes: Partial<ScheduledTask>) => void;
+  deleteScheduledTask: (id: string) => void;
   // Conversation seen tracking
   markConversationSeen: (conversationId: string) => void;
+  // Close/reopen conversations
+  closeConversation: (conversationId: string) => void;
+  reopenConversation: (conversationId: string) => void;
+  // Service actions
+  addService: (conversationId: string, service: Omit<ConversationService, "id">) => void;
+  removeService: (conversationId: string, serviceId: string) => void;
+  // Session ID for Claude conversation continuity
+  setClaudeSessionId: (conversationId: string, sessionId: string) => void;
+  // Set character for a conversation
+  setCharacter: (conversationId: string, characterId: string) => void;
 }

@@ -11,6 +11,11 @@ interface ClaudeResponse {
   tokens_used?: number;
 }
 
+interface ClaudeResult {
+  response: string;
+  session_id: string | null;
+}
+
 interface IntegrationConfig {
   id: string;
   name: string;
@@ -66,7 +71,7 @@ export function useClaude(conversationId: string) {
   }, [conversationId, addTokens]);
 
   const sendMessage = useCallback(
-    async (message: string, systemPrompt?: string, workingDirectory?: string, integrations?: Integration[], continueConversation?: boolean) => {
+    async (message: string, systemPrompt?: string, workingDirectory?: string, integrations?: Integration[], sessionId?: string): Promise<{ response: string; sessionId: string | null }> => {
       setIsLoading(true);
       setStreamingContent("");
       setError(null);
@@ -83,15 +88,15 @@ export function useClaude(conversationId: string) {
       }));
 
       try {
-        const response = await invoke<string>("send_to_claude", {
+        const result = await invoke<ClaudeResult>("send_to_claude", {
           conversationId,
           message,
           systemPrompt,
           workingDirectory,
           integrations: integrationConfigs,
-          continueConversation,
+          sessionId,
         });
-        return response;
+        return { response: result.response, sessionId: result.session_id };
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : String(err);
         setError(errorMessage);
