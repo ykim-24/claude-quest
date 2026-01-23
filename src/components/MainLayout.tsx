@@ -344,14 +344,18 @@ export function MainLayout() {
                     : "text-slate-500 hover:bg-slate-900 hover:text-slate-400"
                 }`}
               >
-                {task.hasNewOutput && activeTask?.id !== task.id && (
-                  <span className="w-2 h-2 rounded-full bg-indigo-500 animate-pulse" />
-                )}
-                {task.lastStatus && (
-                  <span className={`w-1.5 h-1.5 rounded-full ${
-                    task.lastStatus === "success" ? "bg-green-500" : "bg-red-500"
+                <span className="relative w-4 h-4 flex items-center justify-center">
+                  {task.hasNewOutput && activeTask?.id !== task.id && (
+                    <span className="absolute inset-0 rounded-full border-2 border-indigo-500 animate-ping" />
+                  )}
+                  <span className={`w-2.5 h-2.5 rounded-full border-2 ${
+                    task.enabled
+                      ? task.lastStatus === "error"
+                        ? "bg-red-500 border-red-500"
+                        : "bg-green-500 border-green-500"
+                      : "bg-transparent border-slate-600"
                   }`} />
-                )}
+                </span>
                 <span className="truncate max-w-[100px]">{task.name}</span>
               </button>
             ))}
